@@ -20,18 +20,29 @@ package mw.wikidump;
 
 
 import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 
 import mw.utils.NanoTimeFormatter;
 import mw.utils.PlainLogger;
 
-import org.apache.lucene.analysis.PerFieldAnalyzerWrapper;
-import org.apache.lucene.analysis.WhitespaceAnalyzer;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.miscellaneous.PerFieldAnalyzerWrapper;
+import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.analysis.util.CharArraySet;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.queryParser.ParseException;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.queryparser.classic.ParseException;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.Version;
@@ -50,9 +61,9 @@ public class MakeLuceneIndex
      */
     public static void main(String[] args) throws IOException, ParseException
     {
-        String baseDir = "";
-        String wikiDumpFile = "enwiki-20110405-pages-articles.xml";
-        String luceneIndexName = "enwiki-20110405-lucene";
+        String baseDir = "/users/tcohen/helloWiki";
+        String wikiDumpFile = "enwiki-20160601-pages-articles-multistream.xml";
+        String luceneIndexName = "enwiki-20160601-lucene";
         String logFile = luceneIndexName + ".log";
         boolean bIgnoreStubs = false;
 
@@ -74,11 +85,12 @@ public class MakeLuceneIndex
                 bIgnoreStubs = true;
         }
 
+        
+        Map<String,Analyzer> analyzerPerField = new HashMap<>();
+        analyzerPerField.put("tokenized_title", new StandardAnalyzer(CharArraySet.EMPTY_SET));
+        analyzerPerField.put("contents", new StandardAnalyzer(CharArraySet.EMPTY_SET));
 
-        PerFieldAnalyzerWrapper analyzer = new PerFieldAnalyzerWrapper( new WhitespaceAnalyzer( ) );
-        analyzer.addAnalyzer( "tokenized_title", new StandardAnalyzer( Version.LUCENE_30 ) );
-        analyzer.addAnalyzer( "contents", new StandardAnalyzer( Version.LUCENE_30 ) );
-
+        PerFieldAnalyzerWrapper analyzer = new PerFieldAnalyzerWrapper( new WhitespaceAnalyzer( ), analyzerPerField);
 
         File basePath = new File( baseDir );
         File luceneIndex = new File( basePath.getCanonicalPath() + File.separator + luceneIndexName );
@@ -102,9 +114,9 @@ public class MakeLuceneIndex
 
 
         // create the index
-        Directory indexDirectory = new MMapDirectory( luceneIndex, org.apache.lucene.store.NoLockFactory.getNoLockFactory() );
-        IndexWriter indexWriter = new IndexWriter( indexDirectory, analyzer, true, IndexWriter.MaxFieldLength.UNLIMITED );
-
+        Directory indexDirectory = new MMapDirectory(luceneIndex.toPath() ); //original implementation used a noLockingFactory (or some such thing), which doesn't seem to exist in Lucene 5
+        IndexWriterConfig iConfig = new IndexWriterConfig(analyzer);
+        IndexWriter indexWriter = new IndexWriter( indexDirectory, iConfig); //original implementation set maxFieldLength, deprecated in Lucene 5
 
         Extractor wikidumpExtractor = new Extractor( basePath.getCanonicalPath() + File.separator + wikiDumpFile );
         wikidumpExtractor.setLinkSeparator( "_" );
@@ -133,17 +145,37 @@ public class MakeLuceneIndex
             Document doc = new Document();
             ++iArticleCount;
 
-
+            //create new FieldType to store term positions (TextField is not sufficiently configurable)
+            FieldType ft = new FieldType();
+            ft.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
+            ft.setTokenized(true);
+            ft.setStoreTermVectors(true);
+            ft.setStoreTermVectorPositions(true);
+            ft.setStored(false);
+            
+            FieldType ft_stored = new FieldType();
+            ft_stored.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
+            ft_stored.setTokenized(true);
+            ft_stored.setStoreTermVectors(true);
+            ft_stored.setStoreTermVectorPositions(true);
+            ft_stored.setStored(true);
+            
             wikidumpExtractor.setTitleSeparator( "_" );
-            doc.add( new Field( "title", wikidumpExtractor.getPageTitle( false ).toLowerCase(), Field.Store.YES, Field.Index.ANALYZED, Field.TermVector.YES ) );
-
+            Field titleField = new Field("title", wikidumpExtractor.getPageTitle( false ).toLowerCase(), ft_stored);
+            doc.add(titleField);
+      
             wikidumpExtractor.setTitleSeparator( " " );
-            doc.add( new Field( "tokenized_title", wikidumpExtractor.getPageTitle( false ).toLowerCase(), Field.Store.YES, Field.Index.ANALYZED, Field.TermVector.YES ) );
-
-            doc.add( new Field( "categories", wikidumpExtractor.getPageCategories().toLowerCase(), Field.Store.YES, Field.Index.ANALYZED, Field.TermVector.YES ) );
-            doc.add( new Field( "links", wikidumpExtractor.getPageLinks().toLowerCase(), Field.Store.YES, Field.Index.ANALYZED, Field.TermVector.YES ) );
-            doc.add( new Field( "contents", wikidumpExtractor.getPageAbstract().toLowerCase(), Field.Store.NO, Field.Index.ANALYZED, Field.TermVector.YES ) );
-
+            Field tokenizedTitleField = new Field("tokenized_title", wikidumpExtractor.getPageTitle( false ).toLowerCase(), ft);
+            doc.add(tokenizedTitleField);
+            
+            Field categoryField = new Field("categories", wikidumpExtractor.getPageCategories().toLowerCase(),ft_stored);
+            doc.add(categoryField);
+            
+            Field linksField = new Field( "links", wikidumpExtractor.getPageLinks().toLowerCase(), ft_stored);
+            doc.add(linksField);
+            
+            Field contentsField = new Field ( "contents", wikidumpExtractor.getPageText().toLowerCase(), ft );
+            doc.add(contentsField);
 
             indexWriter.addDocument( doc );
 
@@ -176,8 +208,8 @@ public class MakeLuceneIndex
         logger.log( "" );
 
         iTime = System.nanoTime();
-        logger.add( "Optimizing... " );
-        indexWriter.optimize();
+        logger.add( "Commiting... " );
+        indexWriter.commit(); //original implementation "optimized", n/a in Lucene 5
         logger.add( "done in " + NanoTimeFormatter.getS( System.nanoTime() - iTime ) + "s," );
 
         iTime = System.nanoTime();
